@@ -206,12 +206,13 @@ declare
   v_est record;
 begin
   -- 1. Comunidade confirmada nos últimos 7 dias
-  select c.preco, c.usuarios, c.dia,
-         (select max(i.consolidado_em) from public.envio_itens i
-           where i.posto_id = p_posto and i.produto_id = p_produto and i.status = 'confirmado'
-             and i.criado_em::date = c.dia) as quando
+  select i.preco, c.usuarios, c.dia,
+         (select max(x.consolidado_em) from public.envio_itens x
+           where x.posto_id = p_posto and x.produto_id = p_produto and x.status = 'confirmado'
+             and x.criado_em::date = c.dia) as quando
     into v_conf
   from public.precos_comunidade c
+  join public.envio_itens i on i.id = c.envio_item_id
   where c.posto_id = p_posto and c.produto_id = p_produto and c.confirmado
     and c.dia >= current_date - public.parametro('validade_confirmado_d')::int
   order by c.dia desc
@@ -261,8 +262,9 @@ begin
   end if;
 
   -- 3. Comunidade não confirmada (mais de 24 h) contra ANP: vale a mais recente; empate fica com a ANP
-  select c.preco, c.dia, c.usuarios into v_nc
+  select i.preco, c.dia, c.usuarios into v_nc
   from public.precos_comunidade c
+  join public.envio_itens i on i.id = c.envio_item_id
   where c.posto_id = p_posto and c.produto_id = p_produto and not c.confirmado
     and c.dia >= current_date - public.parametro('validade_confirmado_d')::int
   order by c.dia desc
@@ -449,15 +451,15 @@ begin
   end loop;
 
   -- Histórico diário da comunidade
-  insert into public.precos_comunidade (posto_id, produto_id, dia, preco, envios, usuarios, confirmado)
-  select p_posto, p_produto, current_date, v_melhor.preco,
-         count(*), count(distinct usuario_id), true
+  insert into public.precos_comunidade (posto_id, produto_id, dia, envios, usuarios, confirmado, envio_item_id)
+  select p_posto, p_produto, current_date,
+        count(*), count(distinct usuario_id), true, v_melhor.id
   from public.envio_itens
   where posto_id = p_posto and produto_id = p_produto and status = 'confirmado'
     and consolidado_em >= date_trunc('day', now())
   on conflict (posto_id, produto_id, dia) do update set
-    preco = excluded.preco, envios = excluded.envios, usuarios = excluded.usuarios, confirmado = true;
-
+    envios = excluded.envios, usuarios = excluded.usuarios,
+    confirmado = true, envio_item_id = excluded.envio_item_id;
   perform public.atualizar_preco_atual(p_posto, p_produto);
 end;
 $$;
@@ -475,17 +477,17 @@ declare
 begin
   for v_chave in
     select posto_id, produto_id, criado_em::date as dia,
-           percentile_cont(0.5) within group (order by preco) as preco,
-           count(*) as envios, count(distinct usuario_id) as usuarios
+           count(*) as envios, count(distinct usuario_id) as usuarios,
+           (array_agg(id order by criado_em desc))[1] as envio_item_id
     from public.envio_itens
     where status = 'pendente'
       and criado_em < now() - make_interval(hours => public.parametro('janela_consenso_h')::int)
     group by 1, 2, 3
   loop
-    insert into public.precos_comunidade (posto_id, produto_id, dia, preco, envios, usuarios, confirmado)
-    values (v_chave.posto_id, v_chave.produto_id, v_chave.dia, round(v_chave.preco::numeric, 3),
-            v_chave.envios, v_chave.usuarios, false)
-    on conflict (posto_id, produto_id, dia) do nothing;   -- dia já confirmado prevalece
+    insert into public.precos_comunidade (posto_id, produto_id, dia, envios, usuarios, confirmado, envio_item_id)
+    values (v_chave.posto_id, v_chave.produto_id, v_chave.dia,
+            v_chave.envios, v_chave.usuarios, false, v_chave.envio_item_id)
+    on conflict (posto_id, produto_id, dia) do nothing;  -- dia já confirmado prevalece
 
     update public.envio_itens set status = 'expirado', consolidado_em = now()
     where posto_id = v_chave.posto_id and produto_id = v_chave.produto_id
